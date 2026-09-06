@@ -1,0 +1,5 @@
+# Build and test artefacts.
+*.exe
+*.test
+*.out
+coverage.out

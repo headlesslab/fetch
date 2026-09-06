@@ -1,0 +1,23 @@
+# CI through the reusable workflow in headlesslab/.github. The pin is a full
+# commit SHA of that repository's main; Dependabot moves it.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    uses: headlesslab/.github/.github/workflows/go.yml@0b6cd15e797f507e22ae6c40bea75997602c6256 # main
+    with:
+      coverage-threshold: 90
+      # File locks and directory renames differ per OS, so the suite runs on all three.
+      cross-platform: true

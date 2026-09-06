@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # Keep every SHA-pinned action and the reusable-workflow pin moving.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  # Go modules: security updates only. A limit of 0 disables version-update
+  # pull requests; security updates are not subject to the limit.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
