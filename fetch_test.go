@@ -348,6 +348,10 @@ func TestCancelledContextAbortsAndLeavesNothing(t *testing.T) {
 		t.Fatalf("got %v, want context.Canceled", err)
 	}
 
+	if !strings.Contains(err.Error(), h.URL) {
+		t.Fatalf("error %q does not name the attempt on %s", err, h.URL)
+	}
+
 	if exists(dir) {
 		t.Fatalf("%s exists after a cancelled fetch", dir)
 	}
@@ -369,6 +373,10 @@ func TestAlreadyCancelledContextFailsWithoutFetching(t *testing.T) {
 
 	if exists(dir) {
 		t.Fatalf("%s exists after a cancelled fetch", dir)
+	}
+
+	if hits := h.hits.Load(); hits != 0 {
+		t.Fatalf("host got %d requests, want none", hits)
 	}
 }
 
@@ -540,9 +548,7 @@ func TestSymlinkEscapingTheDestinationIsRejected(t *testing.T) {
 }
 
 func TestSymlinkInsideTheArchiveIsRecreated(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("creating symbolic links needs a privilege on Windows")
-	}
+	requireSymlinks(t)
 
 	h := serveZip(t, zipOf(t,
 		entry{name: "a.txt", content: "alpha"},
@@ -865,4 +871,104 @@ func TestGivingUpOnTheLockReturnsTheContextError(t *testing.T) {
 	if got := tree(t, dir)["origin.txt"]; got != "slow" {
 		t.Fatalf("origin.txt: got %q, want %q", got, "slow")
 	}
+}
+
+func TestSymlinkChainCannotReachOutsideTheDestination(t *testing.T) {
+	requireSymlinks(t)
+
+	// "a/b/link" resolves to "a"; anything placed under it is really under
+	// "a", so a target checked against the entry's name alone would pass.
+	cases := map[string][]entry{
+		"link through link": {
+			{name: "a/b/link", content: "..", mode: fs.ModeSymlink | 0o777},
+			{name: "a/b/link/x", content: "../../outside.txt", mode: fs.ModeSymlink | 0o777},
+		},
+		"file through link": {
+			{name: "a/b/link", content: "../../..", mode: fs.ModeSymlink | 0o777},
+			{name: "a/b/link/outside.txt", content: "evil"},
+		},
+		"file over link": {
+			{name: "a/target.txt", content: "kept"},
+			{name: "a/link", content: "target.txt", mode: fs.ModeSymlink | 0o777},
+			{name: "a/link", content: "overwritten through the link"},
+		},
+	}
+
+	for name, entries := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := serveZip(t, zipOf(t, entries...), 0)
+			parent := t.TempDir()
+			dir := filepath.Join(parent, "tool")
+
+			err := fetch.Zip(context.Background(), dir, []string{h.URL + "/a.zip"})
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+
+			if exists(filepath.Join(parent, "outside.txt")) || exists(filepath.Join(filepath.Dir(parent), "outside.txt")) {
+				t.Fatal("a file was written outside the destination")
+			}
+
+			if exists(dir) {
+				t.Fatalf("%s exists after a failed fetch", dir)
+			}
+		})
+	}
+}
+
+func TestRelativeDestinationWorksNextToItselfInTheWorkingDirectory(t *testing.T) {
+	// The temporary directory must be a sibling of the destination, whatever
+	// drive the system temp directory is on: watch for it while the
+	// download trickles in.
+	h := serveTrickle(t, bigMarked(t, "slow"), 8<<10, 30*time.Millisecond, true) // ~0.8 s for the whole body
+	wd := t.TempDir()
+
+	previous, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Chdir(wd); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = os.Chdir(previous) })
+
+	done := make(chan error, 1)
+
+	go func() { done <- fetch.Zip(context.Background(), "tool", []string{h.URL + "/a.zip"}) }()
+
+	sawWork := false
+
+	for !sawWork {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			t.Fatal("the fetch finished without a work directory appearing next to the destination")
+		case <-time.After(10 * time.Millisecond):
+			entries, err := os.ReadDir(wd)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			for _, e := range entries {
+				if strings.HasPrefix(e.Name(), ".tool.fetch-") {
+					sawWork = true
+				}
+			}
+		}
+	}
+
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	if got := tree(t, filepath.Join(wd, "tool"))["origin.txt"]; got != "slow" {
+		t.Fatalf("origin.txt: got %q, want %q", got, "slow")
+	}
+
+	assertNoLeftovers(t, wd, filepath.Join(wd, "tool"))
 }

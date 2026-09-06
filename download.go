@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"time"
 )
@@ -16,38 +15,29 @@ const progressInterval = time.Second
 
 // download streams the body of url into the file at path and returns the
 // hex SHA-256 of what it wrote.
-func download(ctx context.Context, cfg *config, url, path string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return "", err
-	}
-
-	res, err := cfg.client.Do(req)
+func (f *fetcher) download(ctx context.Context, url, path string) (string, error) {
+	res, err := get(ctx, f.client, url)
 	if err != nil {
 		return "", err
 	}
 	defer func() { _ = res.Body.Close() }()
 
-	if res.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("%s: HTTP %s", url, res.Status)
-	}
-
-	f, err := os.Create(path)
+	file, err := os.Create(path)
 	if err != nil {
 		return "", err
 	}
 
 	hash := sha256.New()
-	meter := &progress{logger: cfg.logger, total: res.ContentLength, last: time.Now()}
+	meter := &progress{logger: f.logger, total: res.ContentLength, last: time.Now()}
 
-	_, err = io.Copy(io.MultiWriter(f, hash, meter), res.Body)
+	_, err = io.Copy(io.MultiWriter(file, hash, meter), res.Body)
 	if err != nil {
-		_ = f.Close()
+		_ = file.Close()
 
 		return "", fmt.Errorf("%s: %w", url, err)
 	}
 
-	err = f.Close()
+	err = file.Close()
 	if err != nil {
 		return "", err
 	}

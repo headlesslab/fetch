@@ -48,45 +48,47 @@ type quiet struct{}
 
 func (quiet) Println(...any) {}
 
-type config struct {
-	sha256 string
+// fetcher is what the options build: how to reach the hosts, what to verify
+// against, how to shape the tree and where to report.
+type fetcher struct {
+	digest string
 	strip  bool
 	client *http.Client
 	logger Logger
 }
 
 // Option configures Zip.
-type Option func(*config)
+type Option func(*fetcher)
 
 // WithSHA256 sets the expected hex digest of the archive. The download is
 // hashed as it streams and compared before the archive is opened; a mismatch
 // fails with a *HashMismatchError. An empty digest means no verification,
 // which the logger reports.
 func WithSHA256(hexDigest string) Option {
-	return func(c *config) { c.sha256 = hexDigest }
+	return func(f *fetcher) { f.digest = hexDigest }
 }
 
 // WithStripFirstDir expects the archive to hold exactly one top-level
 // directory and makes that directory's content the destination, the way
 // browser archives nest one folder.
 func WithStripFirstDir() Option {
-	return func(c *config) { c.strip = true }
+	return func(f *fetcher) { f.strip = true }
 }
 
 // WithClient sets the HTTP client. The default is http.DefaultClient.
 func WithClient(client *http.Client) Option {
-	return func(c *config) {
+	return func(f *fetcher) {
 		if client != nil {
-			c.client = client
+			f.client = client
 		}
 	}
 }
 
 // WithLogger sets where event lines go. The default discards them.
 func WithLogger(logger Logger) Option {
-	return func(c *config) {
+	return func(f *fetcher) {
 		if logger != nil {
-			c.logger = logger
+			f.logger = logger
 		}
 	}
 }
@@ -101,21 +103,28 @@ func WithLogger(logger Logger) Option {
 // complete. A file lock next to dir serializes concurrent fetchers of the
 // same directory; when dir already exists, Zip returns without a request.
 func Zip(ctx context.Context, dir string, urls []string, opts ...Option) error {
-	cfg := config{client: http.DefaultClient, logger: quiet{}}
+	f := fetcher{client: http.DefaultClient, logger: quiet{}}
 	for _, opt := range opts {
-		opt(&cfg)
+		opt(&f)
 	}
 
 	if len(urls) == 0 {
 		return errors.New("fetch: no URLs to fetch from")
 	}
 
-	err := cfg.checkDigest()
+	digest, err := normalizeDigest(f.digest)
 	if err != nil {
 		return err
 	}
 
-	dir = filepath.Clean(dir)
+	f.digest = digest
+
+	// Absolute, so the lock file and the work directory are siblings of dir
+	// whatever the working directory is.
+	dir, err = filepath.Abs(dir)
+	if err != nil {
+		return fmt.Errorf("fetch: %w", err)
+	}
 
 	err = os.MkdirAll(filepath.Dir(dir), 0o755)
 	if err != nil {
@@ -142,21 +151,19 @@ func Zip(ctx context.Context, dir string, urls []string, opts ...Option) error {
 	done, err = present(dir)
 	if done || err != nil {
 		if done {
-			cfg.logger.Println("fetch: found", dir, "in place")
+			f.logger.Println("fetch: found", dir, "in place")
 		}
 
 		return err
 	}
 
-	return fetchLocked(ctx, &cfg, dir, urls)
+	return f.fetch(ctx, dir, urls)
 }
 
-// fetchLocked does the work of Zip once the lock is held and dir is known to
-// be absent.
-func fetchLocked(ctx context.Context, cfg *config, dir string, urls []string) error {
-	parent, base := filepath.Split(dir)
-
-	work, err := os.MkdirTemp(parent, "."+base+".fetch-")
+// fetch does the work of Zip once the lock is held and dir is known to be
+// absent.
+func (f *fetcher) fetch(ctx context.Context, dir string, urls []string) error {
+	work, err := os.MkdirTemp(filepath.Dir(dir), "."+filepath.Base(dir)+".fetch-")
 	if err != nil {
 		return fmt.Errorf("fetch: %w", err)
 	}
@@ -169,50 +176,54 @@ func fetchLocked(ctx context.Context, cfg *config, dir string, urls []string) er
 
 	var errs []error
 
-	for r := range probe(probeCtx, cfg.client, urls) {
+	for r := range probe(probeCtx, f.client, urls) {
 		if r.err != nil {
-			cfg.logger.Println("fetch: no answer from", r.err)
+			f.logger.Println("fetch: no answer from", r.err)
 			errs = append(errs, r.err)
 
 			continue
 		}
 
-		err := fetchFrom(ctx, cfg, r.url, work, dir)
+		err := f.fetchFrom(ctx, r.url, work, dir)
 		if err == nil {
 			return nil
 		}
 
-		cfg.logger.Println("fetch: giving up on", err)
+		f.logger.Println("fetch: giving up on", err)
 		errs = append(errs, err)
 	}
 
 	err = ctx.Err()
-	if err != nil {
-		return fmt.Errorf("fetch: %w", err)
-	}
 
-	return fmt.Errorf("fetch: no URL yielded the archive: %w", errors.Join(errs...))
+	switch {
+	case err != nil && len(errs) == 0:
+		return fmt.Errorf("fetch: %w", err)
+	case err != nil:
+		return fmt.Errorf("fetch: %w: %w", err, errors.Join(errs...))
+	default:
+		return fmt.Errorf("fetch: no URL yielded the archive: %w", errors.Join(errs...))
+	}
 }
 
-// fetchFrom downloads url into the work directory, extracts it and renames
-// the extracted tree to dir.
-func fetchFrom(ctx context.Context, cfg *config, url, work, dir string) error {
-	cfg.logger.Println("fetch: downloading", url)
+// fetchFrom downloads url into the work directory, verifies it, extracts it
+// and renames the extracted tree to dir.
+func (f *fetcher) fetchFrom(ctx context.Context, url, work, dir string) error {
+	f.logger.Println("fetch: downloading", url)
 
 	archive := filepath.Join(work, "archive.zip")
 
-	actual, err := download(ctx, cfg, url, archive)
+	actual, err := f.download(ctx, url, archive)
 	if err != nil {
 		return err
 	}
 
 	switch {
-	case cfg.sha256 == "":
-		cfg.logger.Println("fetch: no expected SHA-256, extracting unverified")
-	case actual != cfg.sha256:
-		return &HashMismatchError{URL: url, Expected: cfg.sha256, Actual: actual}
+	case f.digest == "":
+		f.logger.Println("fetch: no expected SHA-256, extracting unverified")
+	case actual != f.digest:
+		return &HashMismatchError{URL: url, Expected: f.digest, Actual: actual}
 	default:
-		cfg.logger.Println("fetch: verified sha256", actual)
+		f.logger.Println("fetch: verified sha256", actual)
 	}
 
 	tree := filepath.Join(work, "tree")
@@ -227,7 +238,7 @@ func fetchFrom(ctx context.Context, cfg *config, url, work, dir string) error {
 		return fmt.Errorf("%s: %w", url, err)
 	}
 
-	if cfg.strip {
+	if f.strip {
 		tree, err = onlyDir(tree)
 		if err != nil {
 			return fmt.Errorf("%s: %w", url, err)
@@ -239,25 +250,25 @@ func fetchFrom(ctx context.Context, cfg *config, url, work, dir string) error {
 		return err
 	}
 
-	cfg.logger.Println("fetch: extracted to", dir)
+	f.logger.Println("fetch: extracted to", dir)
 
 	return nil
 }
 
-// checkDigest normalizes the expected digest and rejects one that is not a
-// SHA-256 in hex before any request is made.
-func (c *config) checkDigest() error {
-	if c.sha256 == "" {
-		return nil
+// normalizeDigest lower-cases an expected digest and rejects one that is not
+// a SHA-256 in hex, before any request is made. Empty stays empty.
+func normalizeDigest(hexDigest string) (string, error) {
+	if hexDigest == "" {
+		return "", nil
 	}
 
-	c.sha256 = strings.ToLower(strings.TrimSpace(c.sha256))
+	digest := strings.ToLower(strings.TrimSpace(hexDigest))
 
-	if b, err := hex.DecodeString(c.sha256); err != nil || len(b) != sha256Len {
-		return fmt.Errorf("fetch: expected SHA-256 %q is not %d hex digits", c.sha256, 2*sha256Len)
+	if b, err := hex.DecodeString(digest); err != nil || len(b) != sha256Len {
+		return "", fmt.Errorf("fetch: expected SHA-256 %q is not %d hex digits", hexDigest, 2*sha256Len)
 	}
 
-	return nil
+	return digest, nil
 }
 
 // present reports whether dir already exists; a non-directory in its place is
@@ -277,23 +288,4 @@ func present(dir string) (bool, error) {
 	}
 
 	return true, nil
-}
-
-// onlyDir returns the single directory that tree holds, for WithStripFirstDir.
-func onlyDir(tree string) (string, error) {
-	entries, err := os.ReadDir(tree)
-	if err != nil {
-		return "", err
-	}
-
-	if len(entries) != 1 || !entries[0].IsDir() {
-		names := make([]string, 0, len(entries))
-		for _, e := range entries {
-			names = append(names, e.Name())
-		}
-
-		return "", fmt.Errorf("expected one top-level directory to strip, found %q", names)
-	}
-
-	return filepath.Join(tree, entries[0].Name()), nil
 }

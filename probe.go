@@ -49,22 +49,14 @@ func probe(ctx context.Context, client *http.Client, urls []string) <-chan respo
 }
 
 func probeOne(ctx context.Context, client *http.Client, url string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
-	}
-
-	res, err := client.Do(req)
+	res, err := get(ctx, client, url)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = res.Body.Close() }()
 
-	if res.StatusCode != http.StatusOK {
-		return fmt.Errorf("%s: HTTP %s", url, res.Status)
-	}
-
-	if _, err := io.CopyN(io.Discard, res.Body, probeSize); err != nil && !errors.Is(err, io.EOF) {
+	_, err = io.CopyN(io.Discard, res.Body, probeSize)
+	if err != nil && !errors.Is(err, io.EOF) {
 		return fmt.Errorf("%s: %w", url, err)
 	}
 

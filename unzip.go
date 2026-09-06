@@ -3,6 +3,7 @@ package fetch
 import (
 	"archive/zip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -11,6 +12,10 @@ import (
 	"path/filepath"
 	"strings"
 )
+
+// maxLinkHops bounds how many symbolic links a path may pass through before
+// it counts as a loop.
+const maxLinkHops = 40
 
 // unzip extracts the archive at archivePath into root, which it creates.
 // Entries that would land outside root fail the extraction.
@@ -21,16 +26,21 @@ func unzip(ctx context.Context, archivePath, root string) error {
 	}
 	defer func() { _ = zr.Close() }()
 
-	if err := os.MkdirAll(root, 0o755); err != nil {
+	err = os.MkdirAll(root, 0o755)
+	if err != nil {
 		return err
 	}
 
+	x := &extractor{root: root, links: map[string]string{}}
+
 	for _, f := range zr.File {
-		if err := ctx.Err(); err != nil {
+		err = ctx.Err()
+		if err != nil {
 			return err
 		}
 
-		if err := extract(f, root); err != nil {
+		err = x.extract(f)
+		if err != nil {
 			return fmt.Errorf("entry %q: %w", f.Name, err)
 		}
 	}
@@ -38,28 +48,55 @@ func unzip(ctx context.Context, archivePath, root string) error {
 	return nil
 }
 
+// extractor writes archive entries under one root that starts out empty, so
+// the only symbolic links that can exist there are the ones it made. It
+// never writes through one of them, and it checks the target of every link
+// against the links made so far, so nothing under root can lead outside it.
+type extractor struct {
+	root  string
+	links map[string]string // slash-separated entry name to its link target
+}
+
 // extract writes one archive entry under root.
-func extract(f *zip.File, root string) error {
+func (x *extractor) extract(f *zip.File) error {
 	name, err := localPath(f.Name)
 	if err != nil {
 		return err
 	}
 
-	target := filepath.Join(root, name)
+	err = x.notThroughLink(name)
+	if err != nil {
+		return err
+	}
+
+	target := filepath.Join(x.root, filepath.FromSlash(name))
 	mode := f.Mode()
 
 	switch {
 	case mode.IsDir():
 		return os.MkdirAll(target, 0o755)
 	case mode&fs.ModeSymlink != 0:
-		return extractSymlink(f, name, target)
+		return x.symlink(f, name, target)
 	default:
 		return extractFile(f, target, mode.Perm())
 	}
 }
 
+// notThroughLink fails when name, or a directory on the way to it, is a
+// symbolic link made earlier: writing there would follow the link.
+func (x *extractor) notThroughLink(name string) error {
+	for p := name; p != "."; p = path.Dir(p) {
+		if _, isLink := x.links[p]; isLink {
+			return fmt.Errorf("path %q passes through the symbolic link %q", name, p)
+		}
+	}
+
+	return nil
+}
+
 func extractFile(f *zip.File, target string, perm fs.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+	err := os.MkdirAll(filepath.Dir(target), 0o755)
+	if err != nil {
 		return err
 	}
 
@@ -74,7 +111,8 @@ func extractFile(f *zip.File, target string, perm fs.FileMode) error {
 		return err
 	}
 
-	if _, err := io.Copy(dst, src); err != nil {
+	_, err = io.Copy(dst, src)
+	if err != nil {
 		_ = dst.Close()
 
 		return err
@@ -83,10 +121,10 @@ func extractFile(f *zip.File, target string, perm fs.FileMode) error {
 	return dst.Close()
 }
 
-// extractSymlink recreates a symbolic-link entry, whose content is the link
-// target. The target must stay under root once resolved against the link's
-// own directory.
-func extractSymlink(f *zip.File, name, target string) error {
+// symlink recreates a symbolic-link entry, whose content is the link target.
+// The target must be relative and stay under root once every link made so
+// far is followed.
+func (x *extractor) symlink(f *zip.File, name, target string) error {
 	src, err := f.Open()
 	if err != nil {
 		return err
@@ -103,28 +141,98 @@ func extractSymlink(f *zip.File, name, target string) error {
 		return fmt.Errorf("symbolic link to absolute path %q", dest)
 	}
 
-	if _, err := localPath(path.Join(path.Dir(filepath.ToSlash(name)), dest)); err != nil {
-		return fmt.Errorf("symbolic link to %q escapes the archive", dest)
+	_, err = x.resolve(path.Dir(name) + "/" + dest)
+	if err != nil {
+		return fmt.Errorf("symbolic link to %q: %w", dest, err)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+	err = os.MkdirAll(filepath.Dir(target), 0o755)
+	if err != nil {
 		return err
 	}
 
-	return os.Symlink(filepath.FromSlash(dest), target)
+	err = os.Symlink(filepath.FromSlash(dest), target)
+	if err != nil {
+		return err
+	}
+
+	x.links[name] = dest
+
+	return nil
 }
 
-// localPath turns an archive entry name into a relative, cleaned path that
-// stays inside the extraction root, or fails. Backslashes count as
-// separators, as archives written on Windows may use them.
+// resolve follows p, a slash-separated path relative to root, one component
+// at a time the way the operating system would, expanding the links made so
+// far, and returns where it ends up. It fails when the path climbs out of
+// root or loops.
+func (x *extractor) resolve(p string) (string, error) {
+	var cur []string
+
+	rest := strings.Split(p, "/")
+	hops := 0
+
+	for len(rest) > 0 {
+		c := rest[0]
+		rest = rest[1:]
+
+		switch c {
+		case "", ".":
+		case "..":
+			if len(cur) == 0 {
+				return "", errors.New("escapes the archive")
+			}
+
+			cur = cur[:len(cur)-1]
+		default:
+			cur = append(cur, c)
+
+			dest, isLink := x.links[strings.Join(cur, "/")]
+			if !isLink {
+				continue
+			}
+
+			hops++
+			if hops > maxLinkHops {
+				return "", errors.New("loops")
+			}
+
+			cur = cur[:len(cur)-1]
+			rest = append(strings.Split(dest, "/"), rest...)
+		}
+	}
+
+	return strings.Join(cur, "/"), nil
+}
+
+// localPath turns an archive entry name into a cleaned, slash-separated
+// relative path that stays inside the extraction root, or fails. Backslashes
+// count as separators, as archives written on Windows may use them.
 func localPath(name string) (string, error) {
 	slashed := strings.ReplaceAll(name, "\\", "/")
 	cleaned := path.Clean(slashed)
-	local := filepath.FromSlash(cleaned)
 
-	if path.IsAbs(slashed) || cleaned == "." || !filepath.IsLocal(local) {
+	if path.IsAbs(slashed) || cleaned == "." || !filepath.IsLocal(filepath.FromSlash(cleaned)) {
 		return "", fmt.Errorf("path %q escapes the archive", name)
 	}
 
-	return local, nil
+	return cleaned, nil
+}
+
+// onlyDir returns the single directory that tree holds, for WithStripFirstDir.
+func onlyDir(tree string) (string, error) {
+	entries, err := os.ReadDir(tree)
+	if err != nil {
+		return "", err
+	}
+
+	if len(entries) != 1 || !entries[0].IsDir() {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+
+		return "", fmt.Errorf("expected one top-level directory to strip, found %q", names)
+	}
+
+	return filepath.Join(tree, entries[0].Name()), nil
 }

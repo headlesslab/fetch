@@ -210,3 +210,15 @@ func assertNoLeftovers(t *testing.T, parent, dir string) {
 		t.Fatalf("leftover %q in %s", name, parent)
 	}
 }
+
+// requireSymlinks skips the test where this machine cannot create symbolic
+// links, which on Windows needs a privilege or Developer Mode.
+func requireSymlinks(t *testing.T) {
+	t.Helper()
+
+	dir := t.TempDir()
+
+	if err := os.Symlink("target", filepath.Join(dir, "link")); err != nil {
+		t.Skipf("cannot create symbolic links here: %v", err)
+	}
+}
