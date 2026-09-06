@@ -193,16 +193,14 @@ func (f *fetcher) fetch(ctx context.Context, dir string, urls []string) error {
 		errs = append(errs, err)
 	}
 
-	err = ctx.Err()
+	// Every URL reported once, so errs holds at least one error here.
+	err = errors.Join(errs...)
 
-	switch {
-	case err != nil && len(errs) == 0:
-		return fmt.Errorf("fetch: %w", err)
-	case err != nil:
-		return fmt.Errorf("fetch: %w: %w", err, errors.Join(errs...))
-	default:
-		return fmt.Errorf("fetch: no URL yielded the archive: %w", errors.Join(errs...))
+	if ctx.Err() != nil {
+		return fmt.Errorf("fetch: %w: %w", ctx.Err(), err)
 	}
+
+	return fmt.Errorf("fetch: no URL yielded the archive: %w", err)
 }
 
 // fetchFrom downloads url into the work directory, verifies it, extracts it
@@ -226,20 +224,19 @@ func (f *fetcher) fetchFrom(ctx context.Context, url, work, dir string) error {
 		f.logger.Println("fetch: verified sha256", actual)
 	}
 
-	tree := filepath.Join(work, "tree")
-
-	err = os.RemoveAll(tree)
+	// A fresh tree per attempt; a failed one goes with the work directory.
+	tree, err := os.MkdirTemp(work, "tree-")
 	if err != nil {
 		return err
 	}
 
-	err = unzip(ctx, archive, tree)
+	tops, err := unzip(ctx, archive, tree)
 	if err != nil {
 		return fmt.Errorf("%s: %w", url, err)
 	}
 
 	if f.strip {
-		tree, err = onlyDir(tree)
+		tree, err = stripped(tree, tops)
 		if err != nil {
 			return fmt.Errorf("%s: %w", url, err)
 		}

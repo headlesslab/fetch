@@ -18,6 +18,6 @@ jobs:
   go:
     uses: headlesslab/.github/.github/workflows/go.yml@736a5f1ae0eedee648abc8b80a80ed5866f5c059 # main
     with:
-      coverage-threshold: 93
+      coverage-threshold: 100
       # File locks and directory renames differ per OS, so the suite runs on all three.
       cross-platform: true

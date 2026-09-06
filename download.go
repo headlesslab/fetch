@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -30,16 +31,12 @@ func (f *fetcher) download(ctx context.Context, url, path string) (string, error
 	hash := sha256.New()
 	meter := &progress{logger: f.logger, total: res.ContentLength, last: time.Now()}
 
+	// A write error can surface at close, so both are one verdict.
 	_, err = io.Copy(io.MultiWriter(file, hash, meter), res.Body)
-	if err != nil {
-		_ = file.Close()
 
+	err = errors.Join(err, file.Close())
+	if err != nil {
 		return "", fmt.Errorf("%s: %w", url, err)
-	}
-
-	err = file.Close()
-	if err != nil {
-		return "", err
 	}
 
 	return hex.EncodeToString(hash.Sum(nil)), nil

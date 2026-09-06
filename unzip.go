@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -17,35 +18,31 @@ import (
 // it counts as a loop.
 const maxLinkHops = 40
 
-// unzip extracts the archive at archivePath into root, which it creates.
-// Entries that would land outside root fail the extraction.
-func unzip(ctx context.Context, archivePath, root string) error {
+// unzip extracts the archive at archivePath into the existing directory root
+// and reports the top-level names it wrote, each with whether it is a
+// directory. Entries that would land outside root fail the extraction.
+func unzip(ctx context.Context, archivePath, root string) (map[string]bool, error) {
 	zr, err := zip.OpenReader(archivePath)
 	if err != nil {
-		return fmt.Errorf("%s: %w", archivePath, err)
+		return nil, fmt.Errorf("%s: %w", archivePath, err)
 	}
 	defer func() { _ = zr.Close() }()
 
-	err = os.MkdirAll(root, 0o755)
-	if err != nil {
-		return err
-	}
-
-	x := &extractor{root: root, links: map[string]string{}}
+	x := &extractor{root: root, links: map[string]string{}, tops: map[string]bool{}}
 
 	for _, f := range zr.File {
 		err = ctx.Err()
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		err = x.extract(f)
 		if err != nil {
-			return fmt.Errorf("entry %q: %w", f.Name, err)
+			return nil, fmt.Errorf("entry %q: %w", f.Name, err)
 		}
 	}
 
-	return nil
+	return x.tops, nil
 }
 
 // extractor writes archive entries under one root that starts out empty, so
@@ -55,6 +52,7 @@ func unzip(ctx context.Context, archivePath, root string) error {
 type extractor struct {
 	root  string
 	links map[string]string // slash-separated entry name to its link target
+	tops  map[string]bool   // top-level name to whether it is a directory
 }
 
 // extract writes one archive entry under root.
@@ -71,6 +69,9 @@ func (x *extractor) extract(f *zip.File) error {
 
 	target := filepath.Join(x.root, filepath.FromSlash(name))
 	mode := f.Mode()
+
+	top, _, nested := strings.Cut(name, "/")
+	x.tops[top] = x.tops[top] || nested || mode.IsDir()
 
 	switch {
 	case mode.IsDir():
@@ -218,21 +219,23 @@ func localPath(name string) (string, error) {
 	return cleaned, nil
 }
 
-// onlyDir returns the single directory that tree holds, for WithStripFirstDir.
-func onlyDir(tree string) (string, error) {
-	entries, err := os.ReadDir(tree)
-	if err != nil {
-		return "", err
-	}
-
-	if len(entries) != 1 || !entries[0].IsDir() {
-		names := make([]string, 0, len(entries))
-		for _, e := range entries {
-			names = append(names, e.Name())
+// stripped returns the one top-level directory under tree, for
+// WithStripFirstDir, given the top-level names unzip reported.
+func stripped(tree string, tops map[string]bool) (string, error) {
+	if len(tops) == 1 {
+		for name, isDir := range tops {
+			if isDir {
+				return filepath.Join(tree, name), nil
+			}
 		}
-
-		return "", fmt.Errorf("expected one top-level directory to strip, found %q", names)
 	}
 
-	return filepath.Join(tree, entries[0].Name()), nil
+	names := make([]string, 0, len(tops))
+	for name := range tops {
+		names = append(names, name)
+	}
+
+	sort.Strings(names)
+
+	return "", fmt.Errorf("expected one top-level directory to strip, found %q", names)
 }
