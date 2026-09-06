@@ -96,8 +96,10 @@ func TestUnreadableParentIsAnError(t *testing.T) {
 }
 
 func TestDeletedWorkingDirectoryIsAnError(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Windows does not let the working directory be removed")
+	// Windows refuses to remove the working directory, and macOS still
+	// reports a path for a removed one; only Linux fails Getwd.
+	if runtime.GOOS != "linux" {
+		t.Skip("only Linux reports a removed working directory")
 	}
 
 	h := serveZip(t, zipOf(t, sample...), 0)
