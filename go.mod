@@ -1,6 +1,6 @@
 module github.com/headlesslab/fetch
 
-go 1.21
+go 1.21.0
 
 require github.com/gofrs/flock v0.12.1
 
